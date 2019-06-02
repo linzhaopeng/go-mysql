@@ -2,11 +2,18 @@ package orm
 
 import (
 	"database/sql"
+	"errors"
 	_ "github.com/go-sql-driver/mysql"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
+)
+
+var (
+	DbPool map[string]*sql.DB
+	connMu sync.RWMutex
+	argsErr = errors.New("args' type error")
 )
 
 type Database struct {
@@ -23,11 +30,6 @@ type Table struct {
 	Db *sql.DB
 }
 
-var (
-	DbPool map[string]*sql.DB
-	connMu sync.RWMutex
-)
-
 func init() {
 	DbPool = make(map[string]*sql.DB)
 }
@@ -42,8 +44,8 @@ func RegisterDb(driverName, dbName string, database Database) (err error) {
 		return
 	}
 
-	//connMu.Lock()
-	//defer connMu.Unlock()
+	connMu.Lock()
+	defer connMu.Unlock()
 	DbPool[dbName] = &sql.DB{}
 	dataSourceName := getDataSourceName(database)
 	db, err = sql.Open(driverName, dataSourceName)
@@ -102,6 +104,9 @@ func (table *Table) Insert(data interface{}) (id int64, err error) {
 		valueArr []interface{}
 	)
 	for i := 0; i < fieldNum; i ++ {
+		if dataType.Field(i).Tag.Get("key") == "primary_key" {
+			continue
+		}
 		if fieldName = dataType.Field(i).Tag.Get("name"); fieldName == "" {
 			fieldName = dataType.Field(i).Name
 		}
@@ -128,13 +133,80 @@ func (table *Table) Insert(data interface{}) (id int64, err error) {
 }
 
 func (table *Table) BatchInsert(data interface{}) (rows int64, err error) {
-	sind := reflect.Indirect(reflect.ValueOf(data))
-	firstData := sind.Index(0).Interface()
+	dataSlice := reflect.Indirect(reflect.ValueOf(data))
+	switch dataSlice.Kind() {
+	case reflect.Slice:
+		if dataSlice.Len() < 1 {
+			return 0, argsErr
+		}
+	default:
+		return 0, argsErr
+	}
+	firstData := dataSlice.Index(0).Interface()
 	dataType := reflect.TypeOf(firstData)
 	var (
 		fieldArr []string 
 		fieldName string
-		valueArr []string
+	)
+	for i := 0; i < dataType.NumField(); i ++ {
+		if fieldName = dataType.Field(i).Tag.Get("name"); fieldName == "" {
+			fieldName = dataType.Field(i).Name
+		}
+		fieldArr = append(fieldArr, fieldName)
+	}
+	sqlStr := "insert into " +
+		table.Name +
+		"(`" +
+		strings.Join(fieldArr, "`, `") +
+		"`) value"
+
+	rowsChannel := make(chan int64)
+	var wg sync.WaitGroup
+	for i, end := 0, 50; i < dataSlice.Len(); {
+		if end >= dataSlice.Len() {
+			end = dataSlice.Len()
+		}
+
+		wg.Add(1)
+		go func(partDataSlice reflect.Value) {
+			defer wg.Done()
+			var valueArr []string
+			for j := 0; j < partDataSlice.Len(); j ++ {
+				var values []string
+				dataValue := reflect.ValueOf(partDataSlice.Index(j).Interface())
+				for k := 0; k < dataValue.NumField(); k ++ {
+					values = append(values, getFieldValue(dataValue.Field(k)))
+				}
+				valueArr = append(valueArr, "('" + strings.Join(values, "', '") + "')")
+			}
+
+			res, err := table.Db.Exec(sqlStr + strings.Join(valueArr, ", "))
+			if err == nil {
+				affectedRows, err := res.RowsAffected()
+				if err == nil {
+					rowsChannel<-affectedRows
+				}
+			}
+		}(dataSlice.Slice(i, end))
+		i, end = end, end + 50
+	}
+
+	go func() {
+		wg.Wait()
+		close(rowsChannel)
+	}()
+
+	for row := range rowsChannel {
+		rows += row
+	}
+	return
+}
+
+func (table *Table) Find(data interface{}, cond string) (err error) {
+	dataType := reflect.TypeOf(&data)
+	var (
+		fieldArr []string
+		fieldName string
 	)
 	for i := 0; i < dataType.NumField(); i ++ {
 		if fieldName = dataType.Field(i).Tag.Get("name"); fieldName == "" {
@@ -143,45 +215,14 @@ func (table *Table) BatchInsert(data interface{}) (rows int64, err error) {
 		fieldArr = append(fieldArr, fieldName)
 	}
 
-	/*valueChannel := make(chan interface{})
-	var wg sync.WaitGroup*/
-	for i := 0; i < sind.Len(); i ++ {
-		/*wg.Add(1)
-		go func(data interface{}) {
-			defer wg.Done()
-			var valueArr []interface{}
-			dataValue := reflect.ValueOf(data)
-			for i := 0; i < dataValue.NumField(); i ++ {
-				valueArr = append(valueArr, getFieldValue(dataValue.Field(i)))
-			}
-			valueChannel<-valueArr
-		}(data[i])*/
-		var values []string
-		dataValue := reflect.ValueOf(sind.Index(i).Interface())
-		for i := 0; i < dataValue.NumField(); i ++ {
-			values = append(values, getFieldValue(dataValue.Field(i)))
-		}
-		valueArr = append(valueArr, "('" + strings.Join(values, "', '") + "')")
-	}
-
-	/*go func() {
-		wg.Wait()
-		close(valueChannel)
-	}()
-
-	for value := range valueChannel {
-		valueArr = append(valueArr, value)
-	}*/
-	sqlStr := "insert into " +
+	sqlStr := "select " +
+		strings.Join(fieldArr, ", ") +
+		" from " +
 		table.Name +
-		"(`" +
-		strings.Join(fieldArr, "`, `") +
-		"`) value"  +
-		strings.Join(valueArr, ",")
-	res, err := table.Db.Exec(sqlStr)
-	if err != nil {
-		return 0, err
-	}
-	rows, err = res.RowsAffected()
+		" where " +
+		cond
+
+	data = table.Db.QueryRow(sqlStr)
+	err = nil
 	return
 }
