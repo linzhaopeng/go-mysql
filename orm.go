@@ -2,11 +2,18 @@ package orm
 
 import (
 	"database/sql"
+	"errors"
 	_ "github.com/go-sql-driver/mysql"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
+)
+
+var (
+	DbPool map[string]*sql.DB
+	connMu sync.RWMutex
+	argsErr = errors.New("args' type error")
 )
 
 type Database struct {
@@ -22,11 +29,6 @@ type Table struct {
 	Name string
 	Db *sql.DB
 }
-
-var (
-	DbPool map[string]*sql.DB
-	connMu sync.RWMutex
-)
 
 func init() {
 	DbPool = make(map[string]*sql.DB)
@@ -102,6 +104,9 @@ func (table *Table) Insert(data interface{}) (id int64, err error) {
 		valueArr []interface{}
 	)
 	for i := 0; i < fieldNum; i ++ {
+		if dataType.Field(i).Tag.Get("key") == "primary_key" {
+			continue
+		}
 		if fieldName = dataType.Field(i).Tag.Get("name"); fieldName == "" {
 			fieldName = dataType.Field(i).Name
 		}
@@ -129,6 +134,14 @@ func (table *Table) Insert(data interface{}) (id int64, err error) {
 
 func (table *Table) BatchInsert(data interface{}) (rows int64, err error) {
 	dataSlice := reflect.Indirect(reflect.ValueOf(data))
+	switch dataSlice.Kind() {
+	case reflect.Slice:
+		if dataSlice.Len() < 1 {
+			return 0, argsErr
+		}
+	default:
+		return 0, argsErr
+	}
 	firstData := dataSlice.Index(0).Interface()
 	dataType := reflect.TypeOf(firstData)
 	var (
@@ -186,5 +199,30 @@ func (table *Table) BatchInsert(data interface{}) (rows int64, err error) {
 	for row := range rowsChannel {
 		rows += row
 	}
+	return
+}
+
+func (table *Table) Find(data interface{}, cond string) (err error) {
+	dataType := reflect.TypeOf(&data)
+	var (
+		fieldArr []string
+		fieldName string
+	)
+	for i := 0; i < dataType.NumField(); i ++ {
+		if fieldName = dataType.Field(i).Tag.Get("name"); fieldName == "" {
+			fieldName = dataType.Field(i).Name
+		}
+		fieldArr = append(fieldArr, fieldName)
+	}
+
+	sqlStr := "select " +
+		strings.Join(fieldArr, ", ") +
+		" from " +
+		table.Name +
+		" where " +
+		cond
+
+	data = table.Db.QueryRow(sqlStr)
+	err = nil
 	return
 }
